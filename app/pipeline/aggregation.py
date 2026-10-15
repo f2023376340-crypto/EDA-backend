@@ -1,4 +1,5 @@
-"""Stage 6 (CLAUDE.md §2): jev_scores + clean_reviews -> AnalysisResult. Pure
+"""Stage 6 (CLAUDE.md §2): jev_scores + jev_category_scores + clean_reviews ->
+AnalysisResult. Pure
 and deterministic: no model calls, no I/O, inputs untouched.
 
 Every sentiment metric comes from Jev's score; star ratings are reported
@@ -15,9 +16,12 @@ import pandas as pd
 from app.llm.jev.client import ScoreRubric
 from app.models.api import (
     AnalysisResult,
+    FeatureInsight,
+    FeatureQuote,
     LevelCount,
     ProductInfo,
     RecencyWindow,
+    ReviewFeature,
     ReviewOut,
     RunStats,
     ScoreScale,
@@ -26,11 +30,13 @@ from app.models.api import (
     TrendPoint,
 )
 from app.models.domain import RatingDistribution, RawProduct
-from app.models.jev import FeatureGenerationOutcome, Sentiment
+from app.models.jev import OVERALL_FEATURE_NAME, Feature, FeatureGenerationOutcome, Sentiment
 
 RECENCY_WINDOWS_DAYS = (7, 30, 90)
 TOP_TERMS = 15
 MIN_TERM_REVIEWS = 2
+QUOTE_LIMIT = 3
+QUOTE_MAX_CHARS = 280
 
 # Daraz review-form labels ("Fluoride Content:", "Freshness:") appear even when
 # left empty. They are Title Case, which keeps the customer's own words: in
@@ -74,8 +80,8 @@ def net_sentiment(positive: int, negative: int, total: int) -> float | None:
 
 def level_sentiment(level: int, max_level: int) -> Sentiment:
     """Levels below the rubric's midpoint are negative, above it positive. For
-    the 5-level rubric: 0 Hostile, 1 Negative -> negative; 2 -> neutral;
-    3 Positive, 4 Enthusiastic -> positive.
+    the 3-level rubric (v3): 0 -> negative, 1 -> neutral, 2 -> positive; for the
+    5-level one (v1/v2): 0-1 negative, 2 neutral, 3-4 positive.
     """
     midpoint = max_level / 2
     if level < midpoint:
@@ -216,7 +222,98 @@ def _optional_float(value: Any) -> float | None:
     return None if pd.isna(value) else float(value)
 
 
-def _review_feed(reviews: pd.DataFrame) -> list[ReviewOut]:
+# -- features -------------------------------------------------------------------------
+
+
+def category_mentions(category_scores: pd.DataFrame, reviews: pd.DataFrame, max_level: int) -> pd.DataFrame:
+    """Mentioned (review, category) rows joined with the review's stars and
+    text, plus a sentiment from the category's own level.
+    """
+    mentioned = category_scores[category_scores["mentioned"].fillna(False).astype(bool)]
+    rows = mentioned.merge(reviews[["review_id", "rating", "text"]], on="review_id", how="inner")
+    rows["sentiment"] = pd.Series(
+        [level_sentiment(int(lv), max_level) for lv in rows["level"]], index=rows.index, dtype=object
+    )
+    return rows
+
+
+def representative_quotes(rows: pd.DataFrame, limit: int = QUOTE_LIMIT) -> list[FeatureQuote]:
+    """The lowest-scored mention (sharpest friction) first, then the highest,
+    then the next lowest. `rows` needs review_id, rating, text, score, sentiment.
+    """
+    ordered = rows.sort_values(["score", "review_id"], kind="stable")
+    if ordered.empty:
+        return []
+    picked = [ordered.index[0]]
+    if len(ordered) > 1:
+        picked.append(ordered.index[-1])
+    picked.extend(i for i in ordered.index[1:-1] if len(picked) < limit)
+    return [
+        FeatureQuote(
+            review_id=str(r["review_id"]),
+            rating=int(r["rating"]),
+            score=round(float(r["score"]), 2),
+            sentiment=r["sentiment"],
+            text=_shorten(str(r["text"])),
+        )
+        for r in _records(rows.loc[picked[:limit]])
+    ]
+
+
+def _shorten(text: str) -> str:
+    return text if len(text) <= QUOTE_MAX_CHARS else text[: QUOTE_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _insight(name: str, description: str, rows: pd.DataFrame, scored_total: int) -> FeatureInsight:
+    counts = _counts(rows)
+    return FeatureInsight(
+        name=name,
+        description=description,
+        mention_count=len(rows),
+        mention_share=round(len(rows) / scored_total, 4) if scored_total else 0.0,
+        avg_score=_mean(rows["score"]),
+        net_sentiment=_net(counts),
+        sentiment=counts,
+        avg_rating=_mean(rows["rating"]),
+        quotes=representative_quotes(rows),
+    )
+
+
+def feature_insights(
+    reviews: pd.DataFrame, mentions: pd.DataFrame, features: list[Feature]
+) -> list[FeatureInsight]:
+    """One insight per generated category, by mention_count (ties keep the
+    generated order). "Overall" comes last and covers scored reviews that mention
+    no other category, using their overall score.
+    """
+    scored = reviews[reviews["score"].notna()]
+    insights = [
+        _insight(f.name, f.description, mentions[mentions["feature"] == f.name], len(scored))
+        for f in features
+        if f.name != OVERALL_FEATURE_NAME
+    ]
+    insights.sort(key=lambda i: -i.mention_count)
+    overall = next((f for f in features if f.name == OVERALL_FEATURE_NAME), None)
+    if overall is not None:
+        generic = scored[~scored["review_id"].isin(mentions["review_id"])]
+        insights.append(_insight(overall.name, overall.description, generic, len(scored)))
+    return insights
+
+
+# -- review feed ----------------------------------------------------------------------
+
+
+def _review_feed(reviews: pd.DataFrame, mentions: pd.DataFrame) -> list[ReviewOut]:
+    by_review: dict[str, list[ReviewFeature]] = {}
+    for m in _records(mentions):
+        by_review.setdefault(str(m["review_id"]), []).append(
+            ReviewFeature(
+                name=str(m["feature"]),
+                score=round(float(m["score"]), 2),
+                level=int(m["level"]),
+                sentiment=m["sentiment"],
+            )
+        )
     return [
         ReviewOut(
             review_id=str(r["review_id"]),
@@ -228,6 +325,7 @@ def _review_feed(reviews: pd.DataFrame) -> list[ReviewOut]:
             level=None if pd.isna(r["level"]) else int(r["level"]),
             confidence=_optional_float(r["confidence"]),
             sentiment=r["sentiment"],
+            features=by_review.get(str(r["review_id"]), []),
         )
         for r in _records(reviews)
     ]
@@ -242,6 +340,7 @@ def build_analysis_result(
     features: FeatureGenerationOutcome | None,
     clean: pd.DataFrame,
     scores: pd.DataFrame,
+    category_scores: pd.DataFrame,
     rubric: ScoreRubric,
     run_id: str,
     scraped_at: datetime,
@@ -249,6 +348,7 @@ def build_analysis_result(
     stats: RunStats,
 ) -> AnalysisResult:
     reviews = with_scores(clean, scores, rubric.max_level)
+    mentions = category_mentions(category_scores, reviews, rubric.max_level)
     counts = _counts(reviews)
     category = (
         features.feature_set.product_category
@@ -270,7 +370,7 @@ def build_analysis_result(
             rating_count=product.total_rating_count,
             rating_distribution=product.rating_distribution,
         ),
-        categories=features.feature_set.features if features else [],
+        features=feature_insights(reviews, mentions, features.feature_set.features) if features else [],
         scale=ScoreScale(
             rubric_version=rubric.version,
             max_level=rubric.max_level,
@@ -285,6 +385,6 @@ def build_analysis_result(
         trend=monthly_trend(reviews),
         rating_distribution=rating_distribution(reviews),
         terms=term_frequencies(reviews),
-        reviews=_review_feed(reviews),
+        reviews=_review_feed(reviews, mentions),
         stats=stats,
     )

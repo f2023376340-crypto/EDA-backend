@@ -2,20 +2,34 @@
 are the contract between stages; see the table in CLAUDE.md §2.
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 from pydantic import BaseModel
 
+from app.models.api import AnalysisResult
 from app.models.domain import RawProduct, RawReview
 from app.models.jev import FeatureGenerationOutcome
 
 RUNS_DIR = Path(__file__).resolve().parents[2] / "data" / "runs"
+_RUN_ID_RE = re.compile(r"\d+_\d{8}-\d{6}")
 
 REVIEW_COLUMNS = ["review_id", "rating", "text", "raw_text", "review_date", "sku_info", "helpful_count"]
 # One row per review sent to Jev; score/level/confidence are empty when the request failed.
 SCORE_COLUMNS = ["review_id", "score", "level", "confidence", "model", "rubric_version"]
+# One row per (scored review, generated category except "Overall");
+# score/level/confidence are empty unless `mentioned`.
+CATEGORY_SCORE_COLUMNS = [
+    "review_id",
+    "feature",
+    "mention_probability",
+    "mentioned",
+    "score",
+    "level",
+    "confidence",
+]
 
 _REVIEW_DTYPES = {
     "review_id": "string",
@@ -32,6 +46,15 @@ _SCORE_DTYPES = {
     "confidence": "float64",
     "model": "string",
     "rubric_version": "string",
+}
+_CATEGORY_SCORE_DTYPES = {
+    "review_id": "string",
+    "feature": "string",
+    "mention_probability": "float64",
+    "mentioned": "boolean",
+    "score": "float64",
+    "level": "Int64",
+    "confidence": "float64",
 }
 
 
@@ -96,9 +119,31 @@ def read_features(run_dir: Path) -> FeatureGenerationOutcome:
     )
 
 
-def write_analysis(run_dir: Path, result: BaseModel) -> Path:
+def write_analysis(run_dir: Path, result: AnalysisResult) -> Path:
     """The final AnalysisResult, so a finished run can be served/inspected again."""
     return _write_json(run_dir / "analysis.json", result)
+
+
+def read_analysis(run_dir: Path) -> AnalysisResult:
+    return AnalysisResult.model_validate_json((run_dir / "analysis.json").read_text(encoding="utf-8"))
+
+
+def find_run_dir(run_id: str) -> Path | None:
+    """Resolve a client-supplied run id. Only ids shaped like new_run_dir's
+    output are accepted, so the id can never escape RUNS_DIR.
+    """
+    if not _RUN_ID_RE.fullmatch(run_id):
+        return None
+    run_dir = RUNS_DIR / run_id
+    return run_dir if (run_dir / "analysis.json").is_file() else None
+
+
+def analysed_run_dirs() -> list[Path]:
+    """Run folders that have an analysis.json, most recently analysed first."""
+    if not RUNS_DIR.is_dir():
+        return []
+    dirs = [d for d in RUNS_DIR.iterdir() if _RUN_ID_RE.fullmatch(d.name) and (d / "analysis.json").is_file()]
+    return sorted(dirs, key=lambda d: (d / "analysis.json").stat().st_mtime, reverse=True)
 
 
 # -- reviews ---------------------------------------------------------------------
@@ -138,3 +183,11 @@ def write_scores(run_dir: Path, df: pd.DataFrame) -> Path:
 
 def read_scores(run_dir: Path) -> pd.DataFrame:
     return _read_csv(run_dir / "jev_scores.csv", _SCORE_DTYPES, SCORE_COLUMNS)
+
+
+def write_category_scores(run_dir: Path, df: pd.DataFrame) -> Path:
+    return _write_csv(run_dir / "jev_category_scores.csv", df, CATEGORY_SCORE_COLUMNS)
+
+
+def read_category_scores(run_dir: Path) -> pd.DataFrame:
+    return _read_csv(run_dir / "jev_category_scores.csv", _CATEGORY_SCORE_DTYPES, CATEGORY_SCORE_COLUMNS)

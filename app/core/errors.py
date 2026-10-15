@@ -13,9 +13,11 @@ ErrorCode = Literal[
     "SCRAPE_TIMEOUT",
     "LLM_UNAVAILABLE",
     "LLM_OUTPUT_INVALID",
+    "RUN_NOT_FOUND",
 ]
 
 _STATUS_BY_CODE: dict[ErrorCode, int] = {
+    "RUN_NOT_FOUND": 404,
     "INVALID_URL": 422,
     "PRODUCT_NOT_FOUND": 404,
     "NO_REVIEWS": 200,
@@ -68,3 +70,7 @@ class LLMUnavailableError(AppError):
 
 class LLMOutputInvalidError(AppError):
     code: ErrorCode = "LLM_OUTPUT_INVALID"
+
+
+class RunNotFoundError(AppError):
+    code: ErrorCode = "RUN_NOT_FOUND"

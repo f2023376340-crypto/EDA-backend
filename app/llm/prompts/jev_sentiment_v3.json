@@ -1,0 +1,12 @@
+{
+  "version": "jev_sentiment_v3",
+  "question_id": "sentiment",
+  "instructions": "Evaluate the sentiment of these e-commerce reviews. CRITICAL: Many reviews are in Roman Urdu. Phrases like 'kaha kuch bheja kuch' (sent the wrong item), 'farig' (useless), or 'dhoka' (scam) indicate poor experiences. Automatically treat receiving the wrong, fake, or damaged item as Negative.",
+  "category_mention_instructions": "Does this review say anything about {name} ({description})?",
+  "category_score_instructions": "How does this customer feel about the product's {name}?",
+  "criteria": [
+    "Negative. Expresses disappointment, states they received the wrong item (e.g., 'kaha kuch bheja kuch'), attacks the brand, or accuses of fraud (e.g., 'dhoka').",
+    "Neutral. A question, a factual statement, or a mention that carries no evaluation either way.",
+    "Positive. Says something worked, recommends it, or expresses any level of satisfaction."
+  ]
+}

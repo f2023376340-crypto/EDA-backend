@@ -26,6 +26,14 @@ def test_valid_urls(url: str, item_id: str, sku_id: str | None) -> None:
     assert ref.sku_id == sku_id
 
 
+def test_empty_slug_link_from_daraz() -> None:
+    ref = validate_daraz_url(
+        "https://www.daraz.pk/products/-i574837330-s2655076903.html?pvid=446cb448&scm=1007.51705&spm=a2a0e.tm80335142"
+    )
+    assert (ref.item_id, ref.sku_id) == ("574837330", "2655076903")
+    assert ref.canonical_url == "https://www.daraz.pk/products/-i574837330-s2655076903.html"
+
+
 def test_canonical_url_drops_query_fragment_and_normalizes_host() -> None:
     ref = validate_daraz_url("http://m.daraz.pk/products/redmi-note-13-i123456789-s987654321.html?spm=x#frag")
     assert ref.canonical_url == CANONICAL

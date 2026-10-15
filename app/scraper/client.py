@@ -11,7 +11,10 @@ Sources (details in README.md):
 
 import asyncio
 import random
+import sys
+import threading
 import time
+from collections.abc import Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -26,6 +29,7 @@ from app.core.config import settings
 from app.core.errors import ProductNotFoundError, ScrapeBlockedError, ScrapeTimeoutError
 from app.core.url_validator import DarazProductRef
 from app.models.domain import RawProduct, RawReview, ScrapeResult
+from app.pipeline.progress import Emit, no_emit
 from app.scraper import parser, review_api
 from app.scraper import selectors as sel
 
@@ -46,6 +50,36 @@ _DETAIL_INFO_WAIT_S = 10.0
 _SCROLL_STEP_PX = 900
 _SCROLL_MAX_STEPS = 25
 
+
+class _PlaywrightLoop:
+    """All Playwright work runs on one dedicated thread whose event loop can
+    start subprocesses. Playwright launches Chromium as a subprocess, and on
+    Windows `fastapi dev` (uvicorn --reload) serves requests on a
+    SelectorEventLoop, which cannot, so launching from the request loop raises
+    NotImplementedError. The browser singleton lives on this loop too.
+    """
+
+    def __init__(self) -> None:
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock = threading.Lock()
+
+    def _ensure(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self._loop is None:
+                loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
+                threading.Thread(target=loop.run_forever, name="playwright-loop", daemon=True).start()
+                self._loop = loop
+            return self._loop
+
+    async def run[T](self, coro: Coroutine[Any, Any, T]) -> T:
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(coro, self._ensure()))
+
+    @property
+    def started(self) -> bool:
+        return self._loop is not None
+
+
+_playwright_loop = _PlaywrightLoop()
 _playwright: Playwright | None = None
 _browser: Browser | None = None
 _browser_lock = asyncio.Lock()
@@ -60,8 +94,7 @@ async def _get_browser() -> Browser:
     return _browser
 
 
-async def close_browser() -> None:
-    """Called from the FastAPI shutdown hook so the process exits cleanly."""
+async def _close_browser() -> None:
     global _playwright, _browser
     if _browser is not None:
         await _browser.close()
@@ -69,6 +102,12 @@ async def close_browser() -> None:
     if _playwright is not None:
         await _playwright.stop()
         _playwright = None
+
+
+async def close_browser() -> None:
+    """Called from the FastAPI shutdown hook so the process exits cleanly."""
+    if _playwright_loop.started:
+        await _playwright_loop.run(_close_browser())
 
 
 def _random_delay_s() -> float:
@@ -136,7 +175,7 @@ async def _load_product(page: Page, capture: _DetailInfoCapture, ref: DarazProdu
 
 
 async def _reviews_via_api(
-    context: BrowserContext, ref: DarazProductRef, max_pages: int
+    context: BrowserContext, ref: DarazProductRef, max_pages: int, emit: Emit
 ) -> review_api.ReviewFetchResult:
     cookies = {c["name"]: c["value"] for c in await context.cookies() if "name" in c and "value" in c}
     headers = {
@@ -147,7 +186,12 @@ async def _reviews_via_api(
     }
     async with httpx.AsyncClient(headers=headers, cookies=cookies, timeout=15.0) as client:
         return await review_api.fetch_reviews(
-            client, ref.item_id, max_pages=max_pages, now=datetime.now(UTC), delay_s=_random_delay_s
+            client,
+            ref.item_id,
+            max_pages=max_pages,
+            now=datetime.now(UTC),
+            delay_s=_random_delay_s,
+            on_page=lambda collected: emit("reviews", {"collected": collected}),
         )
 
 
@@ -162,7 +206,7 @@ def _add_new(new: list[RawReview], seen: set[str], reviews: list[RawReview]) -> 
 
 
 async def _reviews_via_dom(
-    page: Page, total_rating_count: int, max_pages: int
+    page: Page, total_rating_count: int, max_pages: int, emit: Emit
 ) -> review_api.ReviewFetchResult:
     """Fallback: scroll the review module in, read page 1 from the DOM, then
     click "next" until it is disabled. Each click makes the page fetch
@@ -175,6 +219,7 @@ async def _reviews_via_dom(
     seen: set[str] = set()
     reviews: list[RawReview] = []
     _add_new(parser.parse_review_items_from_dom(await page.content(), now=datetime.now(UTC)), seen, reviews)
+    emit("reviews", {"collected": len(reviews)})
 
     # total_rating_count includes reviews Daraz hides, so it is only an upper
     # bound here; the loop normally ends on a disabled button or an empty page.
@@ -199,6 +244,7 @@ async def _reviews_via_dom(
 
         if _add_new(new, seen, reviews) == 0:
             break
+        emit("reviews", {"collected": len(reviews)})
         pages_read += 1
 
     partial = pages_read >= max_pages and (total_rating_count == 0 or len(seen) < total_rating_count)
@@ -206,11 +252,24 @@ async def _reviews_via_dom(
 
 
 async def scrape(
-    ref: DarazProductRef, *, max_pages: int | None = None, review_source: ReviewSource = "auto"
+    ref: DarazProductRef,
+    *,
+    max_pages: int | None = None,
+    review_source: ReviewSource = "auto",
+    emit: Emit = no_emit,
 ) -> ScrapeResult:
     """`max_pages` bounds review pages: 50 reviews each via the API, 5 each via
-    the DOM fallback.
+    the DOM fallback. `emit` gets `product` once the header is parsed and
+    `reviews` as pages come in; it is called from the Playwright thread.
     """
+    return await _playwright_loop.run(
+        _scrape(ref, max_pages=max_pages, review_source=review_source, emit=emit)
+    )
+
+
+async def _scrape(
+    ref: DarazProductRef, *, max_pages: int | None, review_source: ReviewSource, emit: Emit
+) -> ScrapeResult:
     max_pages = max_pages or settings.max_review_pages
     browser = await _get_browser()
     context = await browser.new_context(
@@ -251,13 +310,24 @@ async def scrape(
             ) from exc
 
         product = await _load_product(page, capture, ref)
+        emit(
+            "product",
+            {
+                "name": product.product_name,
+                "category_breadcrumb": product.category_breadcrumb,
+                "price": product.price,
+                "overall_rating": product.overall_rating,
+                "rating_count": product.total_rating_count,
+                "url": product.url,
+            },
+        )
         if product.total_rating_count == 0:
             return ScrapeResult(product=product, reviews=[], partial=False)
 
         result: review_api.ReviewFetchResult | None = None
         if review_source == "auto":
             try:
-                result = await _reviews_via_api(context, ref, max_pages)
+                result = await _reviews_via_api(context, ref, max_pages, emit)
             except review_api.ReviewApiUnavailable as exc:
                 log.warning("review_api_unavailable_using_dom", item_id=ref.item_id, error=str(exc)[:300])
             if result is not None and not result.reviews:
@@ -266,7 +336,7 @@ async def scrape(
         source = "api"
         if result is None:
             source = "dom"
-            result = await _reviews_via_dom(page, product.total_rating_count, max_pages)
+            result = await _reviews_via_dom(page, product.total_rating_count, max_pages, emit)
 
         log.info(
             "scrape_done",

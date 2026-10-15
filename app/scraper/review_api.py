@@ -100,7 +100,9 @@ async def fetch_reviews(
     now: datetime,
     delay_s: Callable[[], float],
     page_size: int = PAGE_SIZE,
+    on_page: Callable[[int], None] | None = None,
 ) -> ReviewFetchResult:
+    """`on_page(collected_so_far)` is called after each page that added reviews."""
     seen: set[str] = set()
     reviews: list[RawReview] = []
     total_items = 0
@@ -139,6 +141,8 @@ async def fetch_reviews(
             break
         seen.update(r.review_id for r in new)
         reviews.extend(new)
+        if on_page:
+            on_page(len(reviews))
         last_page_no = page_no
         last_page_full = page.item_count >= page_size
 

@@ -1,4 +1,5 @@
-"""clean_reviews.csv -> jev_scores.csv (one Jev Score request per review).
+"""clean_reviews.csv + features.json -> jev_scores.csv + jev_category_scores.csv
+(one Jev request per review: overall Score + per-category Noul and Score).
 
 uv run python -m scripts.run_jev --run data/runs/<run> --limit 30
 """
@@ -25,6 +26,12 @@ def main() -> None:
     print(f"mean score {scores['score'].mean():.2f} (0 = {labels[0]}, {len(labels) - 1} = {labels[-1]})")
     by_level = scores["level"].dropna().astype(int).value_counts().sort_index()
     print("  ".join(f"{labels[int(str(lv))]}: {n}" for lv, n in by_level.items()))
+
+    categories = io.read_category_scores(run_dir)
+    mentioned = categories[categories["mentioned"].fillna(False).astype(bool)]
+    summary = mentioned.groupby("feature").agg(mentions=("review_id", "size"), avg_score=("score", "mean"))
+    print("\nper category (mentions, avg score) -> jev_category_scores.csv")
+    print(summary.sort_values("mentions", ascending=False).round(2).to_string())
     if stats:
         print(
             f"requests={stats.requests} failed={stats.failed} "

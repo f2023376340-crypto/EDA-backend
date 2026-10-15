@@ -13,7 +13,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.domain import RatingDistribution
-from app.models.jev import Feature, Sentiment
+from app.models.jev import Sentiment
 
 
 class AnalyzeRequest(BaseModel):
@@ -45,11 +45,11 @@ class SentimentCounts(_Out):
 
 
 class ScoreScale(_Out):
-    """The rubric Jev scored against; `score` values run 0..max_level."""
+    """The rubric reviews were scored against; `score` values run 0..max_level."""
 
     rubric_version: str
     max_level: int
-    labels: list[str]  # index = level, e.g. ["Hostile", "Negative", ...]
+    labels: list[str]  # index = level, e.g. ["Negative", "Neutral", "Positive"]
     descriptions: list[str]
 
 
@@ -87,6 +87,37 @@ class TermFrequency(_Out):
     net_sentiment: float | None
 
 
+class FeatureQuote(_Out):
+    review_id: str
+    rating: int
+    score: float  # the feature's score in this review
+    sentiment: Sentiment
+    text: str
+
+
+class FeatureInsight(_Out):
+    """Per generated category. "Overall" covers scored reviews that mention no
+    other category, using their overall score.
+    """
+
+    name: str
+    description: str
+    mention_count: int
+    mention_share: float  # 0-1, of scored reviews
+    avg_score: float | None
+    net_sentiment: float | None
+    sentiment: SentimentCounts
+    avg_rating: float | None  # stars of the reviews that mention it
+    quotes: list[FeatureQuote]
+
+
+class ReviewFeature(_Out):
+    name: str
+    score: float
+    level: int
+    sentiment: Sentiment
+
+
 class ReviewOut(_Out):
     review_id: str
     rating: int
@@ -97,6 +128,7 @@ class ReviewOut(_Out):
     level: int | None
     confidence: float | None
     sentiment: Sentiment | None
+    features: list[ReviewFeature]  # categories this review talks about
 
 
 class RunStats(_Out):
@@ -115,7 +147,7 @@ class AnalysisResult(_Out):
     generated_at: datetime
     scraped_at: datetime
     product: ProductInfo
-    categories: list[Feature]  # Groq-generated; reviews are not mapped to them yet
+    features: list[FeatureInsight]  # sorted by mention_count, "Overall" last
     scale: ScoreScale
     avg_score: float | None
     net_sentiment: float | None
@@ -127,3 +159,18 @@ class AnalysisResult(_Out):
     terms: list[TermFrequency]
     reviews: list[ReviewOut]
     stats: RunStats
+
+
+class RunSummary(_Out):
+    """One saved analysis, for the recent-analyses list."""
+
+    run_id: str
+    item_id: str
+    product_name: str
+    product_category: str
+    url: str
+    scraped_at: datetime
+    reviews_scored: int
+    avg_score: float | None
+    max_level: int  # avg_score runs 0..max_level
+    net_sentiment: float | None

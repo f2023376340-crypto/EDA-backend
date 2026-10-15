@@ -1,0 +1,14 @@
+{
+  "version": "jev_sentiment_v2",
+  "question_id": "sentiment",
+  "instructions": "How does this customer feel about the product they bought, based on their review?",
+  "category_mention_instructions": "Does this review say anything about {name} ({description})?",
+  "category_score_instructions": "How does this customer feel about the product's {name}?",
+  "criteria": [
+    "Hostile. Attacks the brand or a person. Accusations of fraud, slurs, or telling others to leave.",
+    "Negative. Names a specific problem or disappointment, without attacking anyone.",
+    "Neutral. A question, a factual statement, or a mention that carries no evaluation either way.",
+    "Positive. Says something worked, or recommends it, in ordinary language.",
+    "Enthusiastic. Unprompted advocacy. Tells other people to use it, or calls it the best option available."
+  ]
+}

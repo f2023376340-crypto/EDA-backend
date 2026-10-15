@@ -16,7 +16,8 @@ from app.core.errors import InvalidUrlError
 
 _ALLOWED_HOSTS = {"daraz.pk", "www.daraz.pk", "m.daraz.pk"}
 
-_PATH_RE = re.compile(r"^/products/(?P<slug>[\w\-]+)-i(?P<item_id>\d+)(?:-s(?P<sku_id>\d+))?\.html$")
+# The slug can be empty: Daraz also serves links like /products/-i574837330-s2655076903.html.
+_PATH_RE = re.compile(r"^/products/(?P<slug>[\w\-]*)-i(?P<item_id>\d+)(?:-s(?P<sku_id>\d+))?\.html$")
 
 
 class DarazProductRef(BaseModel):
