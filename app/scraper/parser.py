@@ -13,6 +13,7 @@ no usable rating or id is skipped rather than given an invented value.
 import hashlib
 import json
 import re
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple
 
@@ -228,11 +229,14 @@ def _star_rating_from_masks(item: Tag) -> int | None:
 
 def parse_review_items_from_dom(html: str, *, now: datetime) -> list[RawReview]:
     """DOM fallback. The DOM carries no review id, so one is derived from the
-    review's own content; two identical reviews (same text, rating, date and
-    like count) will therefore collapse into one.
+    review's content plus its occurrence number among identical reviews on the
+    page: two buyers' identical "good" 5-star reviews get distinct ids, while
+    re-parsing an unchanged page yields the same ids (which is how the click
+    loop detects that a page did not advance).
     """
     soup = BeautifulSoup(html, "lxml")
     reviews: list[RawReview] = []
+    occurrences: Counter[str] = Counter()
 
     for item in soup.select(sel.REVIEW_ITEM):
         rating = _star_rating_from_masks(item)
@@ -242,10 +246,11 @@ def parse_review_items_from_dom(html: str, *, now: datetime) -> list[RawReview]:
         date_text = _text_or_none(item.select_one(sel.REVIEW_DATE))
         likes = _parse_int(_text_or_none(item.select_one(sel.REVIEW_LIKE_COUNT)))
         digest = hashlib.sha1(f"{raw_text}|{rating}|{date_text}|{likes}".encode()).hexdigest()[:16]
+        occurrences[digest] += 1
 
         reviews.append(
             RawReview(
-                review_id=f"dom-{digest}",
+                review_id=f"dom-{digest}-{occurrences[digest]}",
                 rating=rating,
                 text=raw_text,
                 raw_text=raw_text,

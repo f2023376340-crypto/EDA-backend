@@ -7,10 +7,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     groq_api_key: str = ""
-    groq_model_features: str = "llama-3.3-70b-versatile"
-    groq_model_jev: str = "llama-3.1-8b-instant"
-    jev_batch_size: int = 10
-    jev_max_concurrency: int = 5
+    groq_model_features: str = "openai/gpt-oss-120b"
+
+    jev_api_key: str = ""
+    jev_base_url: str = "https://api.typesafe.ai/v1"
+    jev_model: str = "jev-1.14.0"
+    jev_max_concurrency: int = 10
 
     scraper_headless: bool = True
     scraper_min_delay_s: float = 1.0

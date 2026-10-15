@@ -7,7 +7,7 @@ uv run python -m scripts.run_scraper "<daraz-url>" --headed --reviews-from dom
 import argparse
 import asyncio
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 
 from app.core.config import settings
 from app.core.errors import AppError
@@ -31,6 +31,10 @@ async def _run(args: argparse.Namespace) -> int:
     run_dir = io.new_run_dir(ref.item_id, now=datetime.now())
     io.write_product(run_dir, result.product)
     io.write_raw_reviews(run_dir, result.reviews)
+    io.write_run_meta(
+        run_dir,
+        io.RunMeta(scraped_at=datetime.now(UTC), reviews_scraped=len(result.reviews), partial=result.partial),
+    )
 
     product = result.product
     print(f"run:      {run_dir}")

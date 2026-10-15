@@ -4,8 +4,8 @@ import pytest
 from langchain_core.runnables import RunnableLambda
 
 from app.llm import feature_generator as fg
-from app.models.domain import RawProduct, RawReview
-from app.models.jev import Feature, FeatureSet
+from app.models.domain import RawProduct
+from app.models.jev import Feature, FeatureSet, JEVReviewInput
 
 
 def _product(item_id: str = "111") -> RawProduct:
@@ -17,8 +17,8 @@ def _product(item_id: str = "111") -> RawProduct:
     )
 
 
-def _reviews() -> list[RawReview]:
-    return [RawReview(review_id="r1", rating=5, text="great camera", raw_text="great camera")]
+def _reviews() -> list[JEVReviewInput]:
+    return [JEVReviewInput(review_id="r1", star_rating=5, text="great camera")]
 
 
 def _feature_set(*names: str) -> FeatureSet:
@@ -107,7 +107,5 @@ async def test_caches_by_item_id(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_review_sample_tolerates_braces() -> None:
-    sample = fg._build_review_sample(
-        [RawReview(review_id="r", rating=4, text="{weird} text", raw_text="{weird} text")]
-    )
+    sample = fg._build_review_sample([JEVReviewInput(review_id="r", star_rating=4, text="{weird} text")])
     assert "{weird}" in sample

@@ -1,0 +1,11 @@
+review_id,rating,text,raw_text,review_date,sku_info,helpful_count
+001,5,<b>Good</b>   product,<b>Good</b>   product,2026-06-02 00:00:00+00:00,,0
+002,5,good product,good product,2026-06-03 00:00:00+00:00,,1
+002,5,good product,good product,2026-06-03 00:00:00+00:00,,1
+003,4,"Freshness：wow
+Cleaning：","Freshness：wow
+Cleaning：",2026-10-14 19:32:59.656766+00:00,,0
+004,3,   ,   ,2026-06-04 00:00:00+00:00,,0
+005,9,too high rating,too high rating,,,0
+006,,no rating,no rating,2026-06-05 00:00:00+00:00,,0
+007,1,good product,good product,2026-06-06 00:00:00+00:00,Color:Red,2

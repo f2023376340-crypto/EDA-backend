@@ -18,8 +18,8 @@ from pydantic import ValidationError
 from app.core.config import settings
 from app.core.errors import LLMUnavailableError
 from app.llm.groq_client import get_chat_model
-from app.models.domain import RawProduct, RawReview
-from app.models.jev import OVERALL_FEATURE_NAME, Feature, FeatureGenerationOutcome, FeatureSet
+from app.models.domain import RawProduct
+from app.models.jev import OVERALL_FEATURE_NAME, Feature, FeatureGenerationOutcome, FeatureSet, JEVReviewInput
 
 log = structlog.get_logger(__name__)
 
@@ -49,8 +49,8 @@ class _InvalidFeatureSet(ValueError):
     pass
 
 
-def _build_review_sample(reviews: list[RawReview]) -> str:
-    lines = [f"- ({r.rating}/5) {r.text[:_SAMPLE_REVIEW_MAX_CHARS]}" for r in reviews if r.text.strip()][
+def _build_review_sample(reviews: list[JEVReviewInput]) -> str:
+    lines = [f"- ({r.star_rating}/5) {r.text[:_SAMPLE_REVIEW_MAX_CHARS]}" for r in reviews if r.text.strip()][
         :_SAMPLE_SIZE
     ]
     return "\n".join(lines) if lines else "(no reviews available)"
@@ -84,7 +84,7 @@ def _fallback(product: RawProduct) -> FeatureGenerationOutcome:
     )
 
 
-async def generate_features(product: RawProduct, reviews: list[RawReview]) -> FeatureGenerationOutcome:
+async def generate_features(product: RawProduct, reviews: list[JEVReviewInput]) -> FeatureGenerationOutcome:
     cached = _cache.get(product.item_id)
     if cached and cached[0] > time.monotonic():
         return cached[1]

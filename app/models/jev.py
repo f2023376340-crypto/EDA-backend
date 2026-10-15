@@ -1,12 +1,14 @@
-"""LLM-facing models shared by feature generation and (later) JEV batch
-processing. Only Feature/FeatureSet are used this session — the JEV batch
-models (JEVReviewInput, FeatureMention, ...) land with the batch-processing
-work per CLAUDE.md §5.2.
+"""Models for feature generation (Groq) and the review input sent to Jev.
+LLM output models forbid extra keys so hallucinated fields fail validation.
 """
+
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 OVERALL_FEATURE_NAME = "Overall"
+
+Sentiment = Literal["positive", "neutral", "negative"]
 
 
 class Feature(BaseModel):
@@ -32,3 +34,9 @@ class FeatureGenerationOutcome(BaseModel):
 
     feature_set: FeatureSet
     used_fallback: bool = False
+
+
+class JEVReviewInput(BaseModel):
+    review_id: str
+    text: str
+    star_rating: int = Field(ge=1, le=5)

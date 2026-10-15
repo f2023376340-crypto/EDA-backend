@@ -88,6 +88,24 @@ def test_parse_review_items_from_dom() -> None:
     ]
 
 
+def _dom_review(text: str, fills: tuple[int, ...] = (100, 100, 100, 100, 100)) -> str:
+    stars = "".join(
+        f'<div class="i-rate-star"><svg><path mask="url(#half_{p}%)"></path></svg></div>' for p in fills
+    )
+    return (
+        f'<div class="item"><div class="top"><div class="starCtn">{stars}</div></div>'
+        f'<div class="item-content"><div class="content">{text}</div></div></div>'
+    )
+
+
+def test_identical_dom_reviews_get_distinct_ids() -> None:
+    html = f'<div class="mod-reviews">{_dom_review("good")}{_dom_review("good")}{_dom_review("nice")}</div>'
+    ids = [r.review_id for r in parser.parse_review_items_from_dom(html, now=NOW)]
+    assert len(set(ids)) == 3
+    assert ids[0].endswith("-1") and ids[1].endswith("-2")
+    assert ids == [r.review_id for r in parser.parse_review_items_from_dom(html, now=NOW)]
+
+
 def test_dom_star_rating_sums_mask_fill() -> None:
     star = '<div class="i-rate-star"><svg><path mask="url(#half_{p}%)"></path></svg></div>'
     stars = "".join(star.format(p=p) for p in (100, 100, 100, 50, 0))

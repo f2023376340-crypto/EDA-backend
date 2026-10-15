@@ -24,4 +24,6 @@ def get_chat_model(model: str, temperature: float) -> ChatGroq:
         api_key=SecretStr(settings.groq_api_key),
         timeout=_TIMEOUT_S,
         max_retries=_MAX_RETRIES,
+        # gpt-oss models reason before answering; "low" keeps classification fast.
+        reasoning_effort="low" if model.startswith("openai/gpt-oss") else None,
     )
