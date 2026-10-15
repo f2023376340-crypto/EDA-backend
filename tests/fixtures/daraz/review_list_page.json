@@ -1,0 +1,42 @@
+{
+ "success": true,
+ "model": {
+  "items": [
+   {
+    "reviewRateId": 84193405954821,
+    "rating": 5,
+    "reviewContent": "Fluoride Content：wow\nFreshness：\nCleaning：Fluoride Content：wow\nFreshness：\nCleaning： ",
+    "reviewTime": "1 day ago",
+    "skuInfo": null,
+    "likeCount": 0
+   },
+   {
+    "reviewRateId": 84216280554821,
+    "rating": 5,
+    "reviewContent": "Texture：\nScent：\nCleansing：Texture：\nScent：\nCleansing：Texture：\nScent：\nCleansing：wow ",
+    "reviewTime": "1 day ago",
+    "skuInfo": null,
+    "likeCount": 0
+   },
+   {
+    "reviewRateId": 82041728554821,
+    "rating": 5,
+    "reviewContent": "I ordered two of them, and the quality and appearance of this product is good.  ",
+    "reviewTime": "02 Jun 2026",
+    "skuInfo": null,
+    "likeCount": 0
+   },
+   {
+    "reviewRateId": null,
+    "rating": 5,
+    "reviewContent": "no id -> skipped",
+    "reviewTime": "1 day ago"
+   }
+  ],
+  "paging": {
+   "totalItems": 169,
+   "totalPages": 34,
+   "currentPage": 2
+  }
+ }
+}

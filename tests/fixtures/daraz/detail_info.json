@@ -1,0 +1,9 @@
+{
+ "api": "mtop.global.detail.web.getdetailinfo",
+ "data": {
+  "module": "{\"product\": {\"title\": \"Sensodyne Original Toothpaste 70gm\"}, \"Breadcrumb\": [{\"title\": \"Health & Beauty\", \"url\": \"https://www.daraz.pk/beauty-health/\"}, {\"title\": \"Personal Care\", \"url\": \"https://www.daraz.pk/personal-care/\"}, {\"title\": \"Oral Care\", \"url\": \"https://www.daraz.pk/oral-care-products/\"}, {\"title\": \"Toothpaste\", \"url\": \"https://www.daraz.pk/toothpaste/\"}, {\"title\": \"Sensodyne Original Toothpaste 70gm\", \"url\": null}], \"skuInfos\": {\"0\": {\"price\": {\"discount\": \"-0.5%\", \"originalPrice\": {\"text\": \"Rs. 380\", \"value\": 380}, \"salePrice\": {\"isCurrencyLeft\": true, \"noSymbolPriceText\": \"378\", \"sign\": \"Rs.\", \"text\": \"Rs. 378\", \"value\": 378}, \"useOldPriceDisplayLogic\": false}}, \"2379054862\": {\"price\": {\"discount\": \"-0.5%\", \"originalPrice\": {\"text\": \"Rs. 380\", \"value\": 380}, \"salePrice\": {\"isCurrencyLeft\": true, \"noSymbolPriceText\": \"378\", \"sign\": \"Rs.\", \"text\": \"Rs. 378\", \"value\": 378}, \"useOldPriceDisplayLogic\": false}}}, \"review\": {\"ratings\": {\"average\": 4.9, \"rateCount\": 169, \"reviewCount\": 169, \"scores\": [156, 6, 1, 2, 2]}}}"
+ },
+ "ret": [
+  "SUCCESS::调用成功"
+ ]
+}

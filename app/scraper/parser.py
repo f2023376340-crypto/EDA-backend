@@ -1,15 +1,20 @@
-"""Pure HTML/JSON -> domain-model parsing. No I/O, no Playwright here — these
-functions take already-fetched HTML/JSON and return RawProduct/RawReview
-rows, so they can be unit-tested against saved fixtures per §6.5.
+"""Pure HTML/JSON -> domain-model parsing. No I/O and no Playwright, so every
+function here can be unit-tested against saved fixtures (§6.5).
 
-Selectors are unconfirmed (see selectors.py docstring); parsing here is
-defensive (missing elements become None/0 rather than raising) so a single
-layout mismatch degrades gracefully instead of failing the whole scrape.
+Sources, in order of preference (see README.md):
+- getDetailInfo mtop response -> product header (parse_detail_info)
+- getReviewList JSON -> reviews (parse_review_list_page)
+- rendered DOM -> both, as a fallback (parse_product_page, parse_review_items_from_dom)
+
+Parsing is defensive: a missing optional field becomes None/0. A review with
+no usable rating or id is skipped rather than given an invented value.
 """
 
+import hashlib
+import json
 import re
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, NamedTuple
 
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -17,15 +22,26 @@ from bs4.element import Tag
 from app.models.domain import RatingDistribution, RawProduct, RawReview
 from app.scraper import selectors as sel
 
-_STAR_WIDTH_RE = re.compile(r"width:\s*([\d.]+)%")
+_MASK_FILL_RE = re.compile(r"half_(\d+(?:\.\d+)?)%")
+_RELATIVE_DATE_RE = re.compile(r"^(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago$", re.I)
+_RELATIVE_UNITS = {
+    "minute": timedelta(minutes=1),
+    "hour": timedelta(hours=1),
+    "day": timedelta(days=1),
+    "week": timedelta(weeks=1),
+    "month": timedelta(days=30),
+    "year": timedelta(days=365),
+}
 
 
-def is_blocked_page(html: str) -> bool:
-    soup = BeautifulSoup(html, "lxml")
-    if any(soup.select(s) for s in sel.CAPTCHA_SELECTORS):
-        return True
-    page_text = soup.get_text(" ", strip=True)
-    return any(marker in page_text for marker in sel.BLOCKED_PAGE_TEXT_MARKERS)
+class ReviewListPage(NamedTuple):
+    reviews: list[RawReview]
+    item_count: int  # raw items on the page, including any skipped as unusable
+    total_items: int
+    total_pages: int
+
+
+# -- shared helpers --------------------------------------------------------
 
 
 def _text_or_none(tag: Tag | None) -> str | None:
@@ -49,131 +65,193 @@ def _parse_int(text: str | None) -> int:
     return int(match.group()) if match else 0
 
 
-def _star_rating_from_style(tag: Tag | None) -> int:
-    """Daraz (as of last confirmation) renders a star rating as a filled-width
-    overlay rather than a numeric attribute; convert the width% to 1-5.
+def _clamp_rating(value: Any) -> int | None:
+    try:
+        rating = round(float(value))
+    except (TypeError, ValueError):
+        return None
+    return rating if 1 <= rating <= 5 else None
+
+
+def _distribution(counts: list[int]) -> RatingDistribution | None:
+    """`counts` is ordered 5-star down to 1-star, as Daraz renders it."""
+    if len(counts) != 5:
+        return None
+    five, four, three, two, one = counts
+    return RatingDistribution(five_star=five, four_star=four, three_star=three, two_star=two, one_star=one)
+
+
+def parse_review_date(text: str | None, *, now: datetime) -> datetime | None:
+    """Daraz shows either an absolute date ("23 Feb 2026") or a relative one
+    ("1 day ago", "3 weeks ago"). Returns a UTC-aware datetime.
     """
-    if tag is None:
-        return 1
-    style = tag.get("style", "")
-    match = _STAR_WIDTH_RE.search(style if isinstance(style, str) else "")
-    if not match:
-        return 1
-    percent = float(match.group(1))
-    return max(1, min(5, round(percent / 20)))
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        return datetime.strptime(text, "%d %b %Y").replace(tzinfo=UTC)
+    except ValueError:
+        pass
+    lowered = text.lower()
+    if lowered in ("just now", "today"):
+        return now
+    if lowered == "yesterday":
+        return now - timedelta(days=1)
+    match = _RELATIVE_DATE_RE.match(text)
+    if match:
+        return now - int(match.group(1)) * _RELATIVE_UNITS[match.group(2).lower()]
+    return None
 
 
-def parse_product_page(html: str, *, item_id: str, sku_id: str | None, url: str) -> RawProduct:
+def is_blocked_page(html: str) -> bool:
     soup = BeautifulSoup(html, "lxml")
+    if any(soup.select(s) for s in sel.CAPTCHA_SELECTORS):
+        return True
+    page_text = soup.get_text(" ", strip=True)
+    return any(marker in page_text for marker in sel.BLOCKED_PAGE_TEXT_MARKERS)
 
-    name = _text_or_none(soup.select_one(sel.PRODUCT_NAME)) or "Unknown product"
-    breadcrumb_links = [a.get_text(strip=True) for a in soup.select(sel.BREADCRUMB)]
-    breadcrumb = " > ".join(link for link in breadcrumb_links if link)
 
-    price = _parse_float(_text_or_none(soup.select_one(sel.PRICE)))
-    overall_rating = _parse_float(_text_or_none(soup.select_one(sel.OVERALL_RATING)))
-    total_rating_count = _parse_int(_text_or_none(soup.select_one(sel.TOTAL_RATING_COUNT)))
+# -- product ---------------------------------------------------------------
 
-    distribution_bars = soup.select(sel.RATING_DISTRIBUTION_BAR)
-    rating_distribution = None
-    if len(distribution_bars) == 5:
-        counts = [_parse_int(_text_or_none(bar)) for bar in distribution_bars]
-        rating_distribution = RatingDistribution(
-            five_star=counts[0],
-            four_star=counts[1],
-            three_star=counts[2],
-            two_star=counts[3],
-            one_star=counts[4],
-        )
+
+def parse_detail_info(
+    payload: dict[str, Any], *, item_id: str, sku_id: str | None, url: str
+) -> RawProduct | None:
+    """Parse a captured getDetailInfo mtop response. Returns None when the
+    response is not the full detail payload (the PDP also fires a short
+    token-handshake call to the same API).
+    """
+    raw_module = (payload.get("data") or {}).get("module")
+    if not isinstance(raw_module, str):
+        return None
+    try:
+        module: dict[str, Any] = json.loads(raw_module)
+    except json.JSONDecodeError:
+        return None
+
+    product = module.get("product") or {}
+    title = product.get("title")
+    if not title:
+        return None
+
+    crumbs = [c.get("title", "") for c in module.get("Breadcrumb") or []]
+    if crumbs and crumbs[-1] == title:
+        crumbs = crumbs[:-1]
+
+    sku_infos = module.get("skuInfos") or {}
+    sku_info = sku_infos.get(sku_id or "") or sku_infos.get("0") or {}
+    sale_price = ((sku_info.get("price") or {}).get("salePrice") or {}).get("value")
+
+    ratings = (module.get("review") or {}).get("ratings") or {}
+    scores = ratings.get("scores") or []
 
     return RawProduct(
         item_id=item_id,
         sku_id=sku_id,
         url=url,
-        product_name=name,
-        category_breadcrumb=breadcrumb,
-        price=price,
-        overall_rating=overall_rating,
-        total_rating_count=total_rating_count,
-        rating_distribution=rating_distribution,
+        product_name=title,
+        category_breadcrumb=" > ".join(c for c in crumbs if c),
+        price=float(sale_price) if sale_price is not None else None,
+        overall_rating=ratings.get("average"),
+        total_rating_count=int(ratings.get("rateCount") or 0),
+        rating_distribution=_distribution([int(s) for s in scores]),
     )
 
 
-def _parse_review_date(text: str | None) -> datetime | None:
-    if not text:
-        return None
-    for fmt in ("%d %b %Y, %H:%M", "%Y-%m-%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
+def parse_product_page(html: str, *, item_id: str, sku_id: str | None, url: str) -> RawProduct:
+    """DOM fallback for the product header."""
+    soup = BeautifulSoup(html, "lxml")
+
+    breadcrumb = " > ".join(text for a in soup.select(sel.BREADCRUMB) if (text := a.get_text(strip=True)))
+    counts = [_parse_int(_text_or_none(el)) for el in soup.select(sel.RATING_DISTRIBUTION_COUNTS)]
+
+    return RawProduct(
+        item_id=item_id,
+        sku_id=sku_id,
+        url=url,
+        product_name=_text_or_none(soup.select_one(sel.PRODUCT_NAME)) or "Unknown product",
+        category_breadcrumb=breadcrumb,
+        price=_parse_float(_text_or_none(soup.select_one(sel.PRICE))),
+        overall_rating=_parse_float(_text_or_none(soup.select_one(sel.OVERALL_RATING))),
+        total_rating_count=_parse_int(_text_or_none(soup.select_one(sel.TOTAL_RATING_COUNT))),
+        rating_distribution=_distribution(counts),
+    )
+
+
+# -- reviews ---------------------------------------------------------------
+
+
+def parse_review_list_page(payload: dict[str, Any], *, now: datetime) -> ReviewListPage:
+    """Parse one getReviewList response. Reviewer names/ids are deliberately
+    not read (§5.4: no personal data beyond what's needed).
+    """
+    model = payload.get("model") or {}
+    paging = model.get("paging") or {}
+    reviews: list[RawReview] = []
+
+    items = model.get("items") or []
+    for item in items:
+        review_id = item.get("reviewRateId")
+        rating = _clamp_rating(item.get("rating"))
+        if review_id is None or rating is None:
             continue
-    return None
+        raw_text = item.get("reviewContent") or ""
+        reviews.append(
+            RawReview(
+                review_id=str(review_id),
+                rating=rating,
+                text=raw_text.strip(),
+                raw_text=raw_text,
+                review_date=parse_review_date(item.get("reviewTime"), now=now),
+                sku_info=item.get("skuInfo") or None,
+                helpful_count=int(item.get("likeCount") or 0),
+            )
+        )
+
+    return ReviewListPage(
+        reviews=reviews,
+        item_count=len(items),
+        total_items=int(paging.get("totalItems") or 0),
+        total_pages=int(paging.get("totalPages") or 0),
+    )
 
 
-def parse_review_items_from_dom(html: str) -> list[RawReview]:
-    """DOM fallback path: parse a rendered review-list page."""
+def _star_rating_from_masks(item: Tag) -> int | None:
+    fill = 0.0
+    for path in item.select(sel.REVIEW_STAR_FILL_PATHS):
+        mask = path.get("mask")
+        match = _MASK_FILL_RE.search(mask if isinstance(mask, str) else "")
+        if match:
+            fill += float(match.group(1))
+    return _clamp_rating(fill / 100) if fill else None
+
+
+def parse_review_items_from_dom(html: str, *, now: datetime) -> list[RawReview]:
+    """DOM fallback. The DOM carries no review id, so one is derived from the
+    review's own content; two identical reviews (same text, rating, date and
+    like count) will therefore collapse into one.
+    """
     soup = BeautifulSoup(html, "lxml")
     reviews: list[RawReview] = []
 
-    for idx, item in enumerate(soup.select(sel.REVIEW_ITEM)):
-        raw_text = _text_or_none(item.select_one(sel.REVIEW_TEXT)) or ""
-        if not raw_text:
+    for item in soup.select(sel.REVIEW_ITEM):
+        rating = _star_rating_from_masks(item)
+        if rating is None:
             continue
-        rating = _star_rating_from_style(item.select_one(sel.REVIEW_RATING_STARS))
-        review_date = _parse_review_date(_text_or_none(item.select_one(sel.REVIEW_DATE)))
-        sku_info = _text_or_none(item.select_one(sel.REVIEW_SKU_INFO))
-        helpful_count = _parse_int(_text_or_none(item.select_one(sel.REVIEW_HELPFUL_COUNT)))
-
-        review_id = item.get("data-review-id")
-        review_id_str = str(review_id) if review_id else f"dom-{hash(raw_text)}-{idx}"
+        raw_text = _text_or_none(item.select_one(sel.REVIEW_TEXT)) or ""
+        date_text = _text_or_none(item.select_one(sel.REVIEW_DATE))
+        likes = _parse_int(_text_or_none(item.select_one(sel.REVIEW_LIKE_COUNT)))
+        digest = hashlib.sha1(f"{raw_text}|{rating}|{date_text}|{likes}".encode()).hexdigest()[:16]
 
         reviews.append(
             RawReview(
-                review_id=review_id_str,
+                review_id=f"dom-{digest}",
                 rating=rating,
                 text=raw_text,
                 raw_text=raw_text,
-                review_date=review_date,
-                sku_info=sku_info,
-                helpful_count=helpful_count,
-            )
-        )
-    return reviews
-
-
-def parse_review_json_page(payload: dict[str, Any]) -> list[RawReview]:
-    """Preferred path: parse one page of the intercepted review JSON endpoint.
-
-    The exact response shape is UNCONFIRMED (see selectors.py). This assumes
-    a top-level `items`/`reviews` list of objects with reasonably-named
-    fields and is defensive about missing keys; it must be re-checked
-    against a real captured payload.
-    """
-    items = payload.get("items") or payload.get("reviews") or payload.get("data") or []
-    reviews: list[RawReview] = []
-
-    for item in items:
-        review_id = str(item.get("reviewId") or item.get("id") or "")
-        if not review_id:
-            continue
-        raw_text = str(item.get("reviewContent") or item.get("content") or "")
-        rating = item.get("rating") or item.get("ratingScore") or 1
-        review_date = None
-        if raw_ts := item.get("reviewTime") or item.get("createTime"):
-            try:
-                review_date = datetime.fromtimestamp(int(raw_ts) / 1000)
-            except (ValueError, TypeError, OSError):
-                review_date = None
-
-        reviews.append(
-            RawReview(
-                review_id=review_id,
-                rating=max(1, min(5, int(rating))),
-                text=raw_text,
-                raw_text=raw_text,
-                review_date=review_date,
-                sku_info=item.get("skuInfo"),
-                helpful_count=int(item.get("usefulCount") or 0),
+                review_date=parse_review_date(date_text, now=now),
+                sku_info=None,
+                helpful_count=likes,
             )
         )
     return reviews

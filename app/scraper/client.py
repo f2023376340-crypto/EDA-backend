@@ -1,46 +1,50 @@
-"""Playwright-driven scraper (§5.4): one browser per process, reused; a
-fresh context per job; always closed in `finally`.
+"""Playwright-driven scraper (§5.4): one browser per process, reused; a fresh
+context per job, always closed in `finally`.
 
-Review pagination: the review JSON endpoint the PDP itself calls is
-intercepted via a response listener (preferred, per CLAUDE.md §2 stage 2),
-but its exact query parameters are UNCONFIRMED this session (see
-selectors.py / README.md) so we cannot yet hand-craft httpx pagination
-requests against it. Until that's confirmed, pagination is driven by
-clicking the page's own "next" control — each click naturally re-triggers
-the same endpoint, so captured responses are still parsed as JSON when
-present, falling back to BeautifulSoup over the rendered DOM otherwise.
-Swap in direct httpx paging once the endpoint is confirmed; the capture
-plumbing here does not change.
+Sources (details in README.md):
+- product header: the PDP's own getDetailInfo response, captured by a
+  response listener; DOM fallback after scrolling the lazy rating module in.
+- reviews: getReviewList paged directly with httpx (review_api.py), reusing
+  this context's cookies and headers; if that endpoint is unusable, fall back to
+  scrolling the review module in and clicking "next" until it is disabled.
 """
 
 import asyncio
 import random
 import time
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from playwright.async_api import (
-    Browser,
-    Page,
-    Playwright,
-    async_playwright,
-)
-from playwright.async_api import (
-    TimeoutError as PlaywrightTimeoutError,
-)
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_random_exponential
+import httpx
+import structlog
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response, async_playwright
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.core.config import settings
 from app.core.errors import ProductNotFoundError, ScrapeBlockedError, ScrapeTimeoutError
 from app.core.url_validator import DarazProductRef
-from app.models.domain import RawReview, ScrapeResult
-from app.scraper import parser
+from app.models.domain import RawProduct, RawReview, ScrapeResult
+from app.scraper import parser, review_api
 from app.scraper import selectors as sel
 
+log = structlog.get_logger(__name__)
+
+ReviewSource = Literal["auto", "dom"]
+
 _DEBUG_DIR = Path(__file__).resolve().parents[2] / "debug"
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+_ACCEPT_LANGUAGE = "en-PK,en;q=0.9"
 
 _NAV_TIMEOUT_MS = 30_000
 _SELECTOR_TIMEOUT_MS = 10_000
+_DETAIL_INFO_WAIT_S = 10.0
+_SCROLL_STEP_PX = 900
+_SCROLL_MAX_STEPS = 25
 
 _playwright: Playwright | None = None
 _browser: Browser | None = None
@@ -57,7 +61,7 @@ async def _get_browser() -> Browser:
 
 
 async def close_browser() -> None:
-    """Call from the FastAPI shutdown hook so the process exits cleanly."""
+    """Called from the FastAPI shutdown hook so the process exits cleanly."""
     global _playwright, _browser
     if _browser is not None:
         await _browser.close()
@@ -76,126 +80,165 @@ async def _dump_debug(page: Page, label: str) -> None:
     stamp = int(time.time())
     try:
         await page.screenshot(path=str(_DEBUG_DIR / f"{label}_{stamp}.png"), full_page=True)
-        html = await page.content()
-        (_DEBUG_DIR / f"{label}_{stamp}.html").write_text(html, encoding="utf-8")
-    except Exception:  # noqa: BLE001 - best-effort diagnostics, must not mask the real error
+        (_DEBUG_DIR / f"{label}_{stamp}.html").write_text(await page.content(), encoding="utf-8")
+    except PlaywrightError:
+        pass  # best-effort diagnostics; must not mask the real error
+
+
+class _DetailInfoCapture:
+    """Keeps the first getDetailInfo response that parses into a product."""
+
+    def __init__(self, ref: DarazProductRef) -> None:
+        self._ref = ref
+        self.product: RawProduct | None = None
+        self.ready = asyncio.Event()
+
+    async def on_response(self, response: Response) -> None:
+        if self.product is not None or sel.DETAIL_INFO_URL_HINT not in response.url.lower():
+            return
+        try:
+            payload: Any = await response.json()
+        except (PlaywrightError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        product = parser.parse_detail_info(
+            payload, item_id=self._ref.item_id, sku_id=self._ref.sku_id, url=self._ref.canonical_url
+        )
+        if product is not None:
+            self.product = product
+            self.ready.set()
+
+
+async def _scroll_until_present(page: Page, selector: str) -> bool:
+    """The rating and review modules are lazy-loaded when scrolled into view."""
+    for _ in range(_SCROLL_MAX_STEPS):
+        if await page.query_selector(selector) is not None:
+            return True
+        await page.mouse.wheel(0, _SCROLL_STEP_PX)
+        await page.wait_for_timeout(500)
+    return await page.query_selector(selector) is not None
+
+
+async def _load_product(page: Page, capture: _DetailInfoCapture, ref: DarazProductRef) -> RawProduct:
+    try:
+        await asyncio.wait_for(capture.ready.wait(), timeout=_DETAIL_INFO_WAIT_S)
+    except TimeoutError:
         pass
+    if capture.product is not None:
+        return capture.product
+
+    log.info("detail_info_missing_using_dom", item_id=ref.item_id)
+    await _scroll_until_present(page, sel.OVERALL_RATING)
+    return parser.parse_product_page(
+        await page.content(), item_id=ref.item_id, sku_id=ref.sku_id, url=ref.canonical_url
+    )
 
 
-class _ReviewJsonCapture:
-    """Collects JSON bodies of responses that look like the review endpoint."""
-
-    def __init__(self) -> None:
-        self.pages: list[dict[str, Any]] = []
-
-    async def on_response(self, response: Any) -> None:
-        if sel.REVIEW_ENDPOINT_URL_HINT not in response.url:
-            return
-        content_type = response.headers.get("content-type", "")
-        if "application/json" not in content_type:
-            return
-        try:
-            payload = await response.json()
-        except Exception:  # noqa: BLE001 - not every matching response is parseable JSON
-            return
-        self.pages.append(payload)
+async def _reviews_via_api(
+    context: BrowserContext, ref: DarazProductRef, max_pages: int
+) -> review_api.ReviewFetchResult:
+    cookies = {c["name"]: c["value"] for c in await context.cookies() if "name" in c and "value" in c}
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept-Language": _ACCEPT_LANGUAGE,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": ref.canonical_url,
+    }
+    async with httpx.AsyncClient(headers=headers, cookies=cookies, timeout=15.0) as client:
+        return await review_api.fetch_reviews(
+            client, ref.item_id, max_pages=max_pages, now=datetime.now(UTC), delay_s=_random_delay_s
+        )
 
 
-@retry(
-    retry=retry_if_exception_type(PlaywrightTimeoutError),
-    stop=stop_after_attempt(3),
-    wait=wait_random_exponential(multiplier=1, max=10),
-)
-async def _goto(page: Page, url: str) -> None:
-    await page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+def _add_new(new: list[RawReview], seen: set[str], reviews: list[RawReview]) -> int:
+    added = 0
+    for review in new:
+        if review.review_id not in seen:
+            seen.add(review.review_id)
+            reviews.append(review)
+            added += 1
+    return added
 
 
-async def _consume_captured_pages(
-    capture: _ReviewJsonCapture, seen_ids: set[str], reviews: list[RawReview]
-) -> bool:
-    """Parses and appends any newly-captured JSON pages. Returns True if any
-    review was new (used to detect an exhausted/idempotent pagination loop).
+async def _reviews_via_dom(
+    page: Page, total_rating_count: int, max_pages: int
+) -> review_api.ReviewFetchResult:
+    """Fallback: scroll the review module in, read page 1 from the DOM, then
+    click "next" until it is disabled. Each click makes the page fetch
+    getReviewList (pageSize=5); that JSON is read when it arrives, since it
+    carries real review ids and dates, else the re-rendered DOM is parsed.
     """
-    found_new = False
-    for payload in capture.pages:
-        for review in parser.parse_review_json_page(payload):
-            if review.review_id not in seen_ids:
-                seen_ids.add(review.review_id)
-                reviews.append(review)
-                found_new = True
-    capture.pages.clear()
-    return found_new
+    if not await _scroll_until_present(page, sel.REVIEW_ITEM):
+        return review_api.ReviewFetchResult([], partial=True)
 
-
-async def _collect_reviews(
-    page: Page, capture: _ReviewJsonCapture, total_rating_count: int
-) -> tuple[list[RawReview], bool]:
-    seen_ids: set[str] = set()
+    seen: set[str] = set()
     reviews: list[RawReview] = []
+    _add_new(parser.parse_review_items_from_dom(await page.content(), now=datetime.now(UTC)), seen, reviews)
 
-    # The initial PDP load may already have triggered the first page of reviews.
-    await _consume_captured_pages(capture, seen_ids, reviews)
-
-    page_num = 1
-    while page_num < settings.max_review_pages:
-        if total_rating_count and len(seen_ids) >= total_rating_count:
-            break
-
+    # total_rating_count includes reviews Daraz hides, so it is only an upper
+    # bound here; the loop normally ends on a disabled button or an empty page.
+    pages_read = 1
+    while pages_read < max_pages and not (total_rating_count and len(seen) >= total_rating_count):
         next_button = await page.query_selector(sel.REVIEW_NEXT_PAGE_BUTTON)
-        if next_button is None:
-            break
-        class_attr = (await next_button.get_attribute("class")) or ""
-        if sel.REVIEW_NEXT_PAGE_BUTTON_DISABLED_CLASS in class_attr:
-            break
-
-        try:
-            await next_button.click(timeout=_SELECTOR_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
+        if next_button is None or await next_button.is_disabled():
             break
 
         await asyncio.sleep(_random_delay_s())
+        new: list[RawReview] = []
+        try:
+            async with page.expect_response(
+                lambda r: sel.REVIEW_LIST_URL_HINT in r.url, timeout=_SELECTOR_TIMEOUT_MS
+            ) as response_info:
+                await next_button.click(timeout=_SELECTOR_TIMEOUT_MS)
+            payload = await (await response_info.value).json()
+            new = parser.parse_review_list_page(payload, now=datetime.now(UTC)).reviews
+        except (PlaywrightTimeoutError, PlaywrightError, ValueError):
+            await page.wait_for_timeout(1500)
+            new = parser.parse_review_items_from_dom(await page.content(), now=datetime.now(UTC))
 
-        got_new_from_api = await _consume_captured_pages(capture, seen_ids, reviews)
-        if not got_new_from_api:
-            html = await page.content()
-            for review in parser.parse_review_items_from_dom(html):
-                if review.review_id not in seen_ids:
-                    seen_ids.add(review.review_id)
-                    reviews.append(review)
+        if _add_new(new, seen, reviews) == 0:
+            break
+        pages_read += 1
 
-        page_num += 1
-
-    partial = page_num >= settings.max_review_pages and (
-        total_rating_count == 0 or len(seen_ids) < total_rating_count
-    )
-    return reviews, partial
+    partial = pages_read >= max_pages and (total_rating_count == 0 or len(seen) < total_rating_count)
+    return review_api.ReviewFetchResult(reviews, partial=partial)
 
 
-async def scrape(ref: DarazProductRef) -> ScrapeResult:
+async def scrape(
+    ref: DarazProductRef, *, max_pages: int | None = None, review_source: ReviewSource = "auto"
+) -> ScrapeResult:
+    """`max_pages` bounds review pages: 50 reviews each via the API, 5 each via
+    the DOM fallback.
+    """
+    max_pages = max_pages or settings.max_review_pages
     browser = await _get_browser()
     context = await browser.new_context(
         locale="en-PK",
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
-        ),
-        extra_http_headers={"Accept-Language": "en-PK,en;q=0.9"},
+        user_agent=_USER_AGENT,
+        extra_http_headers={"Accept-Language": _ACCEPT_LANGUAGE},
+        viewport={"width": 1366, "height": 900},
     )
     try:
         page = await context.new_page()
-        capture = _ReviewJsonCapture()
+        capture = _DetailInfoCapture(ref)
         page.on("response", capture.on_response)
 
         try:
-            await _goto(page, ref.canonical_url)
+            response = await page.goto(
+                ref.canonical_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+            )
         except PlaywrightTimeoutError as exc:
             await _dump_debug(page, f"timeout_{ref.item_id}")
             raise ScrapeTimeoutError(
                 "Daraz did not respond in time.", details={"item_id": ref.item_id}
             ) from exc
 
-        html = await page.content()
-        if parser.is_blocked_page(html):
+        if response is not None and response.status == 404:
+            raise ProductNotFoundError("Product page returned 404.", details={"item_id": ref.item_id})
+        if (response is not None and response.status in (403, 429)) or parser.is_blocked_page(
+            await page.content()
+        ):
             await _dump_debug(page, f"blocked_{ref.item_id}")
             raise ScrapeBlockedError("Daraz returned a bot-check page.", details={"item_id": ref.item_id})
 
@@ -204,26 +247,35 @@ async def scrape(ref: DarazProductRef) -> ScrapeResult:
         except PlaywrightTimeoutError as exc:
             await _dump_debug(page, f"not_found_{ref.item_id}")
             raise ProductNotFoundError(
-                "Could not find product details on the page.",
-                details={"item_id": ref.item_id},
+                "Could not find product details on the page.", details={"item_id": ref.item_id}
             ) from exc
 
-        html = await page.content()
-        product = parser.parse_product_page(
-            html, item_id=ref.item_id, sku_id=ref.sku_id, url=ref.canonical_url
-        )
+        product = await _load_product(page, capture, ref)
+        if product.total_rating_count == 0:
+            return ScrapeResult(product=product, reviews=[], partial=False)
 
-        reviews: list[RawReview] = []
-        partial = False
-        if product.total_rating_count > 0:
+        result: review_api.ReviewFetchResult | None = None
+        if review_source == "auto":
             try:
-                await page.wait_for_selector(sel.REVIEW_SECTION, timeout=_SELECTOR_TIMEOUT_MS)
-                reviews, partial = await _collect_reviews(page, capture, product.total_rating_count)
-            except PlaywrightTimeoutError:
-                # Review section never rendered; return the product with no reviews
-                # rather than failing the whole scrape.
-                partial = True
+                result = await _reviews_via_api(context, ref, max_pages)
+            except review_api.ReviewApiUnavailable as exc:
+                log.warning("review_api_unavailable_using_dom", item_id=ref.item_id, error=str(exc)[:300])
+            if result is not None and not result.reviews:
+                log.warning("review_api_returned_nothing_using_dom", item_id=ref.item_id)
+                result = None
+        source = "api"
+        if result is None:
+            source = "dom"
+            result = await _reviews_via_dom(page, product.total_rating_count, max_pages)
 
-        return ScrapeResult(product=product, reviews=reviews, partial=partial)
+        log.info(
+            "scrape_done",
+            item_id=ref.item_id,
+            reviews=len(result.reviews),
+            reported_total=product.total_rating_count,
+            partial=result.partial,
+            source=source,
+        )
+        return ScrapeResult(product=product, reviews=result.reviews, partial=result.partial)
     finally:
         await context.close()
