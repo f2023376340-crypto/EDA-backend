@@ -21,7 +21,15 @@ from typing import Any, Literal
 
 import httpx
 import structlog
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, Response, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    Response,
+    Route,
+    async_playwright,
+)
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -48,6 +56,18 @@ _NAV_TIMEOUT_MS = 30_000
 _SELECTOR_TIMEOUT_MS = 10_000
 _DETAIL_INFO_WAIT_S = 10.0
 _SCROLL_STEP_PX = 900
+
+# Keeps Chromium inside small hosts (Render free tier: 512 MB). /dev/shm there
+# is tiny, so shared memory goes to /tmp; one renderer, no zygote, no GPU.
+_CHROMIUM_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-extensions",
+    "--no-zygote",
+    "--renderer-process-limit=1",
+]
+# The parsers read JSON responses and DOM text only, so these are never needed.
+_BLOCKED_RESOURCE_TYPES = frozenset({"image", "media", "font"})
 _SCROLL_MAX_STEPS = 25
 
 
@@ -90,8 +110,17 @@ async def _get_browser() -> Browser:
     async with _browser_lock:
         if _browser is None or not _browser.is_connected():
             _playwright = await async_playwright().start()
-            _browser = await _playwright.chromium.launch(headless=settings.scraper_headless)
+            _browser = await _playwright.chromium.launch(
+                headless=settings.scraper_headless, args=_CHROMIUM_ARGS
+            )
     return _browser
+
+
+async def _skip_heavy_resources(route: Route) -> None:
+    if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 async def _close_browser() -> None:
@@ -279,6 +308,7 @@ async def _scrape(
         viewport={"width": 1366, "height": 900},
     )
     try:
+        await context.route("**/*", _skip_heavy_resources)
         page = await context.new_page()
         capture = _DetailInfoCapture(ref)
         page.on("response", capture.on_response)
