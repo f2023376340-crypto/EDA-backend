@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     scraper_min_delay_s: float = 1.0
     scraper_max_delay_s: float = 2.5
     max_review_pages: int = 100
+    # Generous because small hosts (Render free tier: 0.1 CPU) run the PDP's
+    # JavaScript slowly; on a laptop the page is ready in a few seconds.
+    scraper_nav_timeout_s: float = 90.0
+    scraper_wait_timeout_s: float = 30.0
 
     cors_origins: str = "http://localhost:3000"
 

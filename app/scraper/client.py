@@ -52,9 +52,6 @@ _USER_AGENT = (
 )
 _ACCEPT_LANGUAGE = "en-PK,en;q=0.9"
 
-_NAV_TIMEOUT_MS = 30_000
-_SELECTOR_TIMEOUT_MS = 10_000
-_DETAIL_INFO_WAIT_S = 10.0
 _SCROLL_STEP_PX = 900
 
 # Keeps Chromium inside small hosts (Render free tier: 512 MB). /dev/shm there
@@ -139,6 +136,10 @@ async def close_browser() -> None:
         await _playwright_loop.run(_close_browser())
 
 
+def _wait_timeout_ms() -> float:
+    return settings.scraper_wait_timeout_s * 1000
+
+
 def _random_delay_s() -> float:
     return random.uniform(settings.scraper_min_delay_s, settings.scraper_max_delay_s)
 
@@ -190,7 +191,7 @@ async def _scroll_until_present(page: Page, selector: str) -> bool:
 
 async def _load_product(page: Page, capture: _DetailInfoCapture, ref: DarazProductRef) -> RawProduct:
     try:
-        await asyncio.wait_for(capture.ready.wait(), timeout=_DETAIL_INFO_WAIT_S)
+        await asyncio.wait_for(capture.ready.wait(), timeout=settings.scraper_wait_timeout_s)
     except TimeoutError:
         pass
     if capture.product is not None:
@@ -262,9 +263,9 @@ async def _reviews_via_dom(
         new: list[RawReview] = []
         try:
             async with page.expect_response(
-                lambda r: sel.REVIEW_LIST_URL_HINT in r.url, timeout=_SELECTOR_TIMEOUT_MS
+                lambda r: sel.REVIEW_LIST_URL_HINT in r.url, timeout=_wait_timeout_ms()
             ) as response_info:
-                await next_button.click(timeout=_SELECTOR_TIMEOUT_MS)
+                await next_button.click(timeout=_wait_timeout_ms())
             payload = await (await response_info.value).json()
             new = parser.parse_review_list_page(payload, now=datetime.now(UTC)).reviews
         except (PlaywrightTimeoutError, PlaywrightError, ValueError):
@@ -315,7 +316,9 @@ async def _scrape(
 
         try:
             response = await page.goto(
-                ref.canonical_url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS
+                ref.canonical_url,
+                wait_until="domcontentloaded",
+                timeout=settings.scraper_nav_timeout_s * 1000,
             )
         except PlaywrightTimeoutError as exc:
             await _dump_debug(page, f"timeout_{ref.item_id}")
@@ -332,7 +335,7 @@ async def _scrape(
             raise ScrapeBlockedError("Daraz returned a bot-check page.", details={"item_id": ref.item_id})
 
         try:
-            await page.wait_for_selector(sel.PRODUCT_NAME, timeout=_SELECTOR_TIMEOUT_MS)
+            await page.wait_for_selector(sel.PRODUCT_NAME, timeout=_wait_timeout_ms())
         except PlaywrightTimeoutError as exc:
             await _dump_debug(page, f"not_found_{ref.item_id}")
             raise ProductNotFoundError(
